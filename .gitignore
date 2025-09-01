@@ -1,0 +1,8 @@
+__pycache__/
+venv/
+data/
+*.db
+*.png
+*.pdf
+*.txt
+*.pptx
