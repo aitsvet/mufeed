@@ -1,42 +1,29 @@
 import os
-import sqlite3
 import numpy as np
 import faiss
 from sklearn.cluster import DBSCAN
 import cv2
 from pathlib import Path
-import argparse
+import csv
+import sys
 import json
 
-# Initialize database
-DB_PATH = "cluster.db"
+embedding_dir = sys.argv[1]
+index_path = os.path.join(embedding_dir, "embeddings.index")
+metadata_path = os.path.join(embedding_dir, "metadata.json")
+index = faiss.read_index(index_path)
+with open(metadata_path, 'r') as f:
+    metadata = json.load(f)
+image_paths = metadata['image_paths']
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS images
-                 (id INTEGER PRIMARY KEY, 
-                  path TEXT UNIQUE, 
-                  cluster_id INTEGER, 
-                  processed INTEGER DEFAULT 0, 
-                  issue TEXT)''')
-    conn.commit()
-    return conn
+output_dir = sys.argv[2]
+os.makedirs(output_dir, exist_ok=True)
+csv_path = os.path.join(output_dir, "cluster.csv")
+with open(csv_path, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['path', 'cluster_id', 'processed', 'issue'])
 
-def add_images_to_db(conn, image_paths):
-    c = conn.cursor()
-    for path in image_paths:
-        c.execute('INSERT OR IGNORE INTO images (path) VALUES (?)', (str(path),))
-    conn.commit()
-
-def load_embeddings(embedding_dir):
-    index_path = os.path.join(embedding_dir, "embeddings.index")
-    metadata_path = os.path.join(embedding_dir, "metadata.json")
-
-    index = faiss.read_index(index_path)
-    with open(metadata_path, 'r') as f:
-        metadata = json.load(f)
-    return index, metadata['image_paths']
+unprocessed_paths = image_paths.copy()
 
 def calculate_sharpness(image_path):
     img = cv2.imread(str(image_path))
@@ -50,102 +37,93 @@ def stack_images(image_paths, output_path):
     if len(images) == 1:
         cv2.imwrite(str(output_path), images[0])
         return True
-
-    # Stack using median
     stacked = np.median([img.astype(np.float32) for img in images], axis=0).astype(np.uint8)
     cv2.imwrite(str(output_path), stacked)
     return True
 
-def process_cluster(conn, cluster_images):
-    c = conn.cursor()
-    image_paths = [Path(row[0]) for row in cluster_images]
-    output_path = image_paths[0].parent / f"cluster_{image_paths[0].stem}.png"
+while unprocessed_paths:
+    unprocessed_indices = [image_paths.index(str(p)) for p in unprocessed_paths]
+    unprocessed_embeddings = index.reconstruct_n(0, len(image_paths))[unprocessed_indices]
 
-    if not stack_images(image_paths, output_path):
-        return False
-
-    # Check sharpness improvement
-    base_sharpness = calculate_sharpness(image_paths[0])
-    stacked_sharpness = calculate_sharpness(output_path)
-
-    if stacked_sharpness <= base_sharpness * 0.9:
-        print(f"Cluster {image_paths[0].stem} stacking didn't improve sharpness")
-        return False
-
-    # Mark as processed
-    for path, _ in cluster_images:
-        c.execute('UPDATE images SET processed=1 WHERE path=?', (str(path),))
-    conn.commit()
-    return True
-
-def find_best_cluster(embeddings, unprocessed_ids):
-    # Find optimal DBSCAN parameters
-    eps = 0.5  # Will need tuning
-    min_samples = 2
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(embeddings)
+    # Find optimal eps for current unprocessed embeddings
+    eps = 0.8  # Start with a high eps to get small clusters
+    best_cluster_size = 0
+    max_attempts = 10
+    eps_step = 0.1
+    
+    for _ in range(max_attempts):
+        clustering = DBSCAN(eps=eps, min_samples=2).fit(unprocessed_embeddings)
+        labels = clustering.labels_
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        valid_labels = unique_labels[unique_labels != -1]
+        valid_counts = counts[unique_labels != -1]
+        if eps < eps_step:
+            break
+        if len(valid_counts) == 0:
+            eps -= eps_step
+            continue
+        max_count = valid_counts[np.argmax(valid_counts)]
+        if max_count <= 8 and max_count >= 4:
+            break
+        if max_count < 4:
+            eps -= eps_step
+        else:
+            eps += eps_step
+    
+    # Get the best cluster size from the final eps
+    clustering = DBSCAN(eps=eps, min_samples=2).fit(unprocessed_embeddings)
     labels = clustering.labels_
-
-    # Get unique labels and their counts
     unique_labels, counts = np.unique(labels, return_counts=True)
-    # Filter out noise (-1)
     valid_labels = unique_labels[unique_labels != -1]
     valid_counts = counts[unique_labels != -1]
-
-    if len(valid_labels) == 0:
-        return None
+    
+    if len(valid_counts) == 0:
+        break
+    
+    max_count = valid_counts[np.argmax(valid_counts)]
+    print(f"Using eps={eps} which gives cluster size={max_count}")
 
     # Find the label with the maximum count
     best_label = valid_labels[np.argmax(valid_counts)]
 
-    # Return indices of the best cluster
+    # Get indices of the best cluster
     cluster_mask = labels == best_label
-    return np.array(unprocessed_ids)[cluster_mask]
+    cluster_indices = np.array(unprocessed_indices)[cluster_mask]
+    
+    # Get image paths for this cluster
+    cluster_images = [image_paths[i] for i in cluster_indices]
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Cluster images using embeddings')
-    parser.add_argument('--embedding_dir', type=str, required=True, help='Folder with embeddings')
-    parser.add_argument('--output_dir', type=str, required=True, help='Folder to save clusters')
+    # Process and save
+    output_path = Path(cluster_images[0]).parent / f"cluster_{Path(cluster_images[0]).stem}.png"
+    
+    if not stack_images(cluster_images, output_path):
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for path in cluster_images:
+                writer.writerow([path, None, 1, "stacking_failed"])
+        break
 
-    args = parser.parse_args()
+    # Check sharpness improvement
+    base_sharpness = calculate_sharpness(cluster_images[0])
+    stacked_sharpness = calculate_sharpness(output_path)
 
-    # Initialize
-    os.makedirs(args.output_dir, exist_ok=True)
-    conn = init_db()
+    if stacked_sharpness <= base_sharpness * 0.9:
+        print(f"Cluster {Path(cluster_images[0]).stem} stacking didn't improve sharpness")
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for path in cluster_images:
+                writer.writerow([path, None, 1, "sharpness_not_improved"])
+        break
 
-    # Load embeddings and image paths
-    index, image_paths = load_embeddings(args.embedding_dir)
-    add_images_to_db(conn, image_paths)
+    # Mark as processed
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        for path in cluster_images:
+            writer.writerow([path, cluster_images[0], 1, None])
+    
+    # Update unprocessed_paths
+    unprocessed_paths = [p for p in unprocessed_paths if p not in cluster_images]
 
-    while True:
-        # Get unprocessed images
-        c = conn.cursor()
-        c.execute('SELECT path FROM images WHERE processed=0')
-        unprocessed_paths = [Path(row[0]) for row in c.fetchall()]
-        if not unprocessed_paths:
-            break
-
-        # Get their embeddings
-        unprocessed_indices = [image_paths.index(str(p)) for p in unprocessed_paths]
-        unprocessed_embeddings = index.reconstruct_n(0, len(image_paths))[unprocessed_indices]
-
-        # Find best cluster
-        cluster_indices = find_best_cluster(unprocessed_embeddings, unprocessed_indices)
-        if cluster_indices is None:
-            break
-
-        # Get image paths for this cluster
-        cluster_images = [(image_paths[i], i) for i in cluster_indices]
-
-        # Process and save
-        if process_cluster(conn, cluster_images):
-            print(f"Processed cluster with {len(cluster_images)} images")
-        else:
-            # Mark as problematic
-            for path, _ in cluster_images:
-                c.execute('UPDATE images SET issue=?, processed=1 WHERE path=?', 
-                         ("stacking_failed", str(path)))
-            conn.commit()
-
-    print("Clustering completed")
+print("Clustering completed")
 
 
